@@ -1,0 +1,935 @@
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#define _WIN32_WINNT 0x0400
+#include <windows.h>
+#include <commctrl.h>
+#ifndef MAPVK_VK_TO_VSC
+#define MAPVK_VK_TO_VSC 0
+#endif
+
+#include "../global.h"
+#include "../config.h"
+#include "../gameboy.h"
+#include "../memory.h"
+#include "platform.h"
+#include "winrsrc.h"
+
+#define SAMPLE_RATE 8000
+
+enum
+{
+    CMD_FILE_OPEN = 1000,
+    CMD_FILE_CLOSE,
+    CMD_FILE_EXIT,
+    
+    CMD_EMULATION_RESET,
+    CMD_EMULATION_PAUSE,
+    CMD_EMULATION_RESUME,
+    CMD_EMULATION_STEPFRAME,
+    
+    CMD_VIEW_SHOWMENUBAR,
+    CMD_VIEW_FIXEDASPECTRATIO,
+    CMD_VIEW_SNAPWINDOWSIZE,
+    
+    CMD_OPTIONS_CONFIGUREKEYS,
+    
+    CMD_HELP_ABOUT,
+    
+    CMD_VIEW_COLORS = 2000,
+};
+
+struct RGBColor
+{
+    uint8_t red;
+    uint8_t green;
+    uint8_t blue;
+};
+
+struct Palette
+{
+    const char *name;
+    struct RGBColor colors[4];
+};
+
+static const struct Palette palettes[] =
+{
+    {
+        "Grayscale",
+        {
+            {255, 255, 255},
+            {171, 171, 171},
+            {85,  85,  85 },
+            {0,   0,   0  },
+        }
+    },
+    {
+        "Game Boy LCD",
+        {
+            {127, 181, 60},
+            {102, 172, 60},
+            {55,  99,  48},
+            {49,  49,  49},
+        }
+    },
+    {
+        "Forest Green",
+        {
+            {224, 248, 208},
+            {136, 192, 112},
+            {52,  104, 86 },
+            {8,   24,  32 },
+        }
+    },
+    {
+        "Lava",
+        {
+            {255, 240, 0},
+            {255, 128, 0},
+            {255, 0,   0},
+            {128, 64,  0},
+        }
+    },
+    {
+        "Cool Blue",
+        {
+            {180, 180, 255},
+            {128, 128, 255},
+            {64,  64,  128},
+            {0,   0,   32 },
+        }
+    },
+    {
+        "ZOMG PONIES!",
+        {
+            {255,   0,   200},
+            {64,   255, 64},
+            {128,  128, 255},
+            {64,  0,   128},
+        }
+    }
+};
+
+struct BITMAPINFO4COLOR
+{
+    BITMAPINFOHEADER bmiHeader;
+    RGBQUAD bmiColors[4];
+};
+
+static const char wndClassName[] = "gbemu_wc";
+static HWND hWnd = NULL;
+static HMENU hMenuBar;
+static HMENU hPopupMenu;
+static ACCEL kbAccelTable[] =
+{
+    {FCONTROL | FVIRTKEY, 'O', CMD_FILE_OPEN},
+    {FCONTROL | FVIRTKEY, 'W', CMD_FILE_CLOSE},
+    {FCONTROL | FVIRTKEY, 'P', CMD_EMULATION_PAUSE},
+    {FCONTROL | FVIRTKEY, 'R', CMD_EMULATION_RESUME},
+    {FCONTROL | FVIRTKEY, 'S', CMD_EMULATION_STEPFRAME},
+};
+static unsigned int clientDiffX;
+static unsigned int clientDiffY;
+static struct BITMAPINFO4COLOR bmpInfo =
+{
+    .bmiHeader =
+    {
+        .biSize = sizeof(BITMAPINFOHEADER),
+        .biWidth = GB_DISPLAY_WIDTH,
+        .biHeight = -GB_DISPLAY_HEIGHT,
+        .biPlanes = 1,
+        .biBitCount = 8,
+        .biCompression = BI_RGB,
+        .biSizeImage = GB_DISPLAY_WIDTH * GB_DISPLAY_HEIGHT,
+        .biXPelsPerMeter = 0,
+        .biYPelsPerMeter = 0,
+        .biClrUsed = 4,
+        .biClrImportant = 4,
+    },
+    .bmiColors = {{0}},
+};
+static uint8_t frameBufferPixels[GB_DISPLAY_WIDTH * GB_DISPLAY_HEIGHT];
+//static HWAVEOUT hAudioDevice;
+static char currentDirectory[MAX_PATH];
+static char currentRomName[MAX_PATH];
+static bool isRomLoaded = false;
+static bool isRunning = false;
+static bool fastForward = false;
+
+// Dialogs
+static HWND hKeyConfigDialog = NULL;
+static HWND hAboutDialog = NULL;
+
+void platform_fatal_error(char *fmt, ...)
+{
+    va_list args;
+    char buffer[1000];
+    
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    MessageBox(hWnd, buffer, NULL, MB_ICONERROR | MB_OK);
+    va_end(args);
+    config_save(CONFIG_FILE_NAME);
+    exit(1);
+}
+
+void platform_error(char *fmt, ...)
+{
+    va_list args;
+    char buffer[1000];
+    
+    va_start(args, fmt);
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    MessageBox(hWnd, buffer, NULL, MB_ICONERROR | MB_OK);
+    va_end(args);
+}
+
+/*
+static char *get_error_text(DWORD errCode)
+{
+    static char errText[500];
+    
+    FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+      NULL, errCode, 0, errText, sizeof(errText), NULL);
+    return errText;
+}
+*/
+
+uint8_t *platform_get_framebuffer(void)
+{
+    return frameBufferPixels;
+}
+
+#define TEST_BUFFER_WIDTH (16 * 8)
+#define TEST_BUFFER_HEIGHT (16 * 8)
+
+void draw_tile(uint8_t *buffer, int tileNum, int row, int col)
+{
+    uint8_t *tileData = vram + 0;
+    int x, y;
+    
+    #define PIX_XY(x, y) buffer[(y) * TEST_BUFFER_WIDTH + (x)]
+    
+    for (y = 0; y < 8; y++)
+    {
+        uint8_t data1 = tileData[16 * tileNum + 2 * y + 0];
+        uint8_t data2 = tileData[16 * tileNum + 2 * y + 1];
+        
+        for (x = 0; x < 8; x++)
+        {
+            PIX_XY(col * 8 + x, row * 8 + y) = ((data1 >> (7 - x)) & 1) | (((data2 >> (7 - x)) & 1) << 1);
+        }
+    }
+    #undef PIX_XY
+}
+
+#define DRAW_SCREEN
+
+void StretchDIBits_(HDC hdc, int XDest, int YDest, int nDestWidth, int nDestHeight, int XSrc, int YSrc, int nSrcWidth, int nSrcHeight, const VOID *lpBits, const BITMAPINFO *lpBitsInfo, UINT iUsage, DWORD dwRop)
+{
+    StretchDIBits(hdc, XDest, YDest, nDestWidth, nDestHeight, XSrc, YSrc, nSrcWidth, nSrcHeight, lpBits, lpBitsInfo, iUsage, dwRop);
+}
+
+void platform_draw_done(void)
+{
+    HDC hDC;
+    static uint32_t frameBuffer[GB_DISPLAY_WIDTH * GB_DISPLAY_HEIGHT];
+    const struct RGBColor *colors = palettes[gConfig.colorPalette].colors;
+    
+    for (unsigned int i = 0; i < GB_DISPLAY_WIDTH * GB_DISPLAY_HEIGHT; i++)
+    {
+        uint8_t pixel = frameBufferPixels[i];
+        
+        frameBuffer[i] = colors[pixel].blue | (colors[pixel].green << 8) | (colors[pixel].red << 16);
+    }
+    hDC = GetDC(hWnd);
+    bmpInfo.bmiHeader.biBitCount = 32;
+    bmpInfo.bmiHeader.biCompression = BI_RGB;
+    bmpInfo.bmiHeader.biSizeImage = sizeof(frameBuffer);
+    bmpInfo.bmiHeader.biClrUsed = 0;
+    StretchDIBits(hDC, 0, 0, gConfig.windowWidth, gConfig.windowHeight, 0, 0, GB_DISPLAY_WIDTH, GB_DISPLAY_HEIGHT,
+      frameBuffer, (BITMAPINFO *)&bmpInfo, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(hWnd, hDC);
+}
+
+/*
+void platform_draw_done(void)
+{
+    HDC hDC;
+    
+#ifdef DRAW_SCREEN
+    hDC = GetDC(hWnd);
+    StretchDIBits_(hDC, 0, 0, gConfig.windowWidth, gConfig.windowHeight, 0, 0, GB_DISPLAY_WIDTH, GB_DISPLAY_HEIGHT,
+      frameBufferPixels, (BITMAPINFO *)&bmpInfo, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(hWnd, hDC);
+#else
+    int row, col;
+    uint8_t testBuffer[TEST_BUFFER_WIDTH * TEST_BUFFER_HEIGHT] = {0};
+    
+    hDC = GetDC(hWnd);
+ #ifdef DRAW_TILES
+    // Display tiles
+    for (row = 0; row < 16; row++)
+    {
+        for (col = 0; col < 16; col++)
+        {
+            draw_tile(testBuffer, row * 16 + col, row, col);
+        }
+    }
+ #else
+    uint8_t *pTileNum = vram + 0x1800;
+    for (row = 0; row < 32; row++)
+    {
+        for (col = 0; col < 32; col++)
+        {
+            draw_tile(testBuffer, *pTileNum, (row + REG_SCY / 8) % 32, col);
+            pTileNum++;
+        }
+    }
+ #endif
+    bmpInfo.bmiHeader.biWidth = TEST_BUFFER_WIDTH;
+    bmpInfo.bmiHeader.biHeight = -TEST_BUFFER_HEIGHT;
+    bmpInfo.bmiHeader.biSizeImage = TEST_BUFFER_WIDTH * TEST_BUFFER_HEIGHT;
+    StretchDIBits(hDC, 0, 0, GB_DISPLAY_WIDTH, GB_DISPLAY_HEIGHT, 0, 0, GB_DISPLAY_WIDTH, GB_DISPLAY_HEIGHT,
+      testBuffer, (BITMAPINFO *)&bmpInfo, DIB_RGB_COLORS, SRCCOPY);
+    ReleaseDC(hWnd, hDC);
+#endif
+}
+*/
+
+static void set_palette(unsigned int newPaletteNum)
+{
+    if (newPaletteNum < ARRAY_COUNT(palettes))
+    {
+        const struct Palette *palette = &palettes[newPaletteNum];
+        
+        CheckMenuItem(hMenuBar, CMD_VIEW_COLORS + gConfig.colorPalette, MF_UNCHECKED);
+        CheckMenuItem(hMenuBar, CMD_VIEW_COLORS + newPaletteNum, MF_CHECKED);
+        gConfig.colorPalette = newPaletteNum;
+        config_save(CONFIG_FILE_NAME);
+        for (unsigned int i = 0; i < 4; i++)
+        {
+            bmpInfo.bmiColors[i].rgbRed = palette->colors[i].red;
+            bmpInfo.bmiColors[i].rgbGreen = palette->colors[i].green;
+            bmpInfo.bmiColors[i].rgbBlue = palette->colors[i].blue;
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
+// ROM handling functions
+//------------------------------------------------------------------------------
+
+static void try_load_rom(const char *filename)
+{
+    if (gameboy_load_rom(filename))
+    {
+        strcpy(currentRomName, filename);
+        isRomLoaded = true;
+        isRunning = true;
+        EnableMenuItem(hMenuBar, CMD_FILE_CLOSE, MF_ENABLED);
+        EnableMenuItem(hMenuBar, CMD_EMULATION_RESET, MF_ENABLED);
+        EnableMenuItem(hMenuBar, CMD_EMULATION_PAUSE, MF_ENABLED);
+        EnableMenuItem(hMenuBar, CMD_EMULATION_RESUME, MF_GRAYED);
+        SetWindowText(hWnd, APPNAME" (running)");
+    }
+    else
+        platform_error("Failed to load ROM '%s'", filename);
+}
+
+static void close_game(void)
+{
+    gameboy_close_rom();
+    memset(frameBufferPixels, 0, sizeof(frameBufferPixels));
+    RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE);
+    isRomLoaded = false;
+    isRunning = false;
+    EnableMenuItem(hMenuBar, CMD_FILE_CLOSE, MF_GRAYED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_RESET, MF_GRAYED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_PAUSE, MF_GRAYED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_RESUME, MF_GRAYED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_STEPFRAME, MF_GRAYED);
+    SetWindowText(hWnd, APPNAME);
+}
+
+static void pause_game(void)
+{
+    isRunning = false;
+    EnableMenuItem(hMenuBar, CMD_EMULATION_PAUSE, MF_GRAYED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_RESUME, MF_ENABLED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_STEPFRAME, MF_ENABLED);
+    SetWindowText(hWnd, APPNAME" (paused)");
+}
+
+static void resume_game(void)
+{
+    isRunning = true;
+    EnableMenuItem(hMenuBar, CMD_EMULATION_PAUSE, MF_ENABLED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_RESUME, MF_GRAYED);
+    EnableMenuItem(hMenuBar, CMD_EMULATION_STEPFRAME, MF_GRAYED);
+    SetWindowText(hWnd, APPNAME" (running)");
+}
+
+//------------------------------------------------------------------------------
+// Key Configuration Dialog
+//------------------------------------------------------------------------------
+
+static WNDPROC prevEditProc;
+
+static char *key_code_to_key_name(unsigned int keyCode)
+{
+    static char keyNameBuffer[100];
+    
+    GetKeyNameText(keyCode << 16, keyNameBuffer, sizeof(keyNameBuffer));
+    return keyNameBuffer;
+}
+
+static LRESULT CALLBACK key_edit_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+      case WM_SETFOCUS:
+      case WM_KILLFOCUS:
+        RedrawWindow(hWnd, NULL, NULL, RDW_ERASE | RDW_INVALIDATE);
+        break;
+      case WM_KEYDOWN:
+        {
+            unsigned int *pKeyConfig = (unsigned int *)GetWindowLongPtr(hWnd, GWLP_USERDATA);
+            
+            *pKeyConfig = (lParam >> 16) & 0x1FF;
+            SetWindowText(hWnd, key_code_to_key_name(*pKeyConfig));
+        }
+        break;
+      case WM_CHAR:
+        break;
+      default:
+        return CallWindowProc(prevEditProc, hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+static INT_PTR CALLBACK keys_dlg_proc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    static struct ConfigKeys newKeys;
+
+    switch (msg)
+    {
+      case WM_COMMAND:
+        switch (LOWORD(wParam))
+        {
+          case IDOK:
+            gConfig.keys = newKeys;
+            EndDialog(hwndDlg, 0);
+            hKeyConfigDialog = NULL;
+            config_save(CONFIG_FILE_NAME);
+            return TRUE;
+          case IDCANCEL:
+            EndDialog(hwndDlg, 0);
+            hKeyConfigDialog = NULL;
+            return TRUE;
+          case ID_BTN_APPLY:
+            gConfig.keys = newKeys;
+            config_save(CONFIG_FILE_NAME);
+            return TRUE;
+        }
+        break;
+      case WM_CTLCOLOREDIT:
+        if (GetFocus() == (HWND)lParam)
+        {
+            SetBkColor((HDC)wParam, GetSysColor(COLOR_HIGHLIGHT));
+            SetTextColor((HDC)wParam, GetSysColor(COLOR_HIGHLIGHTTEXT));
+            return (INT_PTR)GetSysColorBrush(COLOR_HIGHLIGHT);
+        }
+        break;
+      case WM_INITDIALOG:
+        {
+            struct {unsigned int id; unsigned int *pKeyConfig;} keyEditorTable[] =
+            {
+                {ID_EDIT_ABUTTON, &newKeys.a},
+                {ID_EDIT_BBUTTON, &newKeys.b},
+                {ID_EDIT_STARTBUTTON, &newKeys.start},
+                {ID_EDIT_SELECTBUTTON, &newKeys.select},
+                {ID_EDIT_DPADUP, &newKeys.up},
+                {ID_EDIT_DPADDOWN, &newKeys.down},
+                {ID_EDIT_DPADLEFT, &newKeys.left},
+                {ID_EDIT_DPADRIGHT, &newKeys.right},
+                {ID_EDIT_FFWDBUTTON, &newKeys.fastFwd},
+            };
+            WNDCLASS editWndClass;
+            
+            newKeys = gConfig.keys;
+            GetClassInfo(NULL, WC_EDIT, &editWndClass);
+            prevEditProc = editWndClass.lpfnWndProc;
+            for (unsigned int i = 0; i < ARRAY_COUNT(keyEditorTable); i++)
+            {
+                HWND hEditBox = GetDlgItem(hwndDlg, keyEditorTable[i].id);
+                
+                SetWindowText(hEditBox, key_code_to_key_name(*keyEditorTable[i].pKeyConfig));
+                SetWindowLongPtr(hEditBox, GWLP_USERDATA, (UINT_PTR)keyEditorTable[i].pKeyConfig);
+                SetWindowLongPtr(hEditBox, GWLP_WNDPROC, (LONG_PTR)key_edit_proc);
+            }
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+//------------------------------------------------------------------------------
+// About Dialog
+//------------------------------------------------------------------------------
+
+static INT_PTR CALLBACK about_dlg_proc(HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    UNUSED(wParam);
+    UNUSED(lParam);
+    if (msg == WM_COMMAND)
+    {
+        EndDialog(hwndDlg, 0);
+        hAboutDialog = NULL;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+//------------------------------------------------------------------------------
+// Main Window
+//------------------------------------------------------------------------------
+
+static void calc_client_diff(void)
+{
+    RECT windowRect;
+    RECT clientRect;
+    
+    GetWindowRect(hWnd, &windowRect);
+    GetClientRect(hWnd, &clientRect);
+    clientDiffX = (windowRect.right - windowRect.left) - (clientRect.right - clientRect.left);
+    clientDiffY = (windowRect.bottom - windowRect.top) - (clientRect.bottom - clientRect.top);
+}
+
+static void update_window_size(void)
+{
+    SetWindowPos(hWnd, NULL,
+      0, 0, gConfig.windowWidth + clientDiffX, gConfig.windowHeight + clientDiffY,
+      SWP_NOMOVE | SWP_NOOWNERZORDER | SWP_NOZORDER);
+}
+
+static void create_main_menu(void)
+{
+    HMENU hFileMenu;
+    HMENU hEmulationMenu;
+    HMENU hViewMenu;
+    HMENU hColorsMenu;
+    HMENU hOptionsMenu;
+    HMENU hHelpMenu;
+    
+    hMenuBar = CreateMenu();
+    hPopupMenu = CreatePopupMenu();
+    
+    hFileMenu = CreatePopupMenu();
+    AppendMenu(hFileMenu, MF_STRING, CMD_FILE_OPEN, "Open\tCtrl+O");
+    AppendMenu(hFileMenu, MF_STRING | MF_GRAYED, CMD_FILE_CLOSE, "Close\tCtrl+W");
+    AppendMenu(hFileMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hFileMenu, MF_STRING, CMD_FILE_EXIT, "Exit\tAlt+F4");
+    AppendMenu(hMenuBar, MF_POPUP | MF_STRING, (UINT_PTR)hFileMenu, "File");
+    AppendMenu(hPopupMenu, MF_POPUP | MF_STRING, (UINT_PTR)hFileMenu, "File");
+    
+    hEmulationMenu = CreatePopupMenu();
+    AppendMenu(hEmulationMenu, MF_STRING | (isRomLoaded ? MF_ENABLED : MF_GRAYED), CMD_EMULATION_RESET, "Reset");
+    AppendMenu(hEmulationMenu, MF_STRING | (isRunning ? MF_ENABLED : MF_GRAYED), CMD_EMULATION_PAUSE, "Pause\tCtrl+P");
+    AppendMenu(hEmulationMenu, MF_STRING | ((isRomLoaded && !isRunning) ? MF_ENABLED : MF_GRAYED), CMD_EMULATION_RESUME, "Resume\tCtrl+R");
+    AppendMenu(hEmulationMenu, MF_STRING | ((isRomLoaded && !isRunning) ? MF_ENABLED : MF_GRAYED), CMD_EMULATION_STEPFRAME, "Step Frame\tCtrl+S");
+    AppendMenu(hMenuBar, MF_POPUP | MF_STRING, (UINT_PTR)hEmulationMenu, "Emulation");
+    AppendMenu(hPopupMenu, MF_POPUP | MF_STRING, (UINT_PTR)hEmulationMenu, "Emulation");
+    
+    hViewMenu = CreatePopupMenu();
+    AppendMenu(hViewMenu, MF_STRING | (gConfig.showMenuBar ? MF_CHECKED : MF_UNCHECKED),
+      CMD_VIEW_SHOWMENUBAR, "Show Menu Bar");
+    AppendMenu(hViewMenu, MF_STRING | (gConfig.fixedAspectRatio ? MF_CHECKED : MF_UNCHECKED),
+      CMD_VIEW_FIXEDASPECTRATIO, "Fixed Aspect Ratio");
+    AppendMenu(hViewMenu, MF_STRING | (gConfig.snapWindowSize ? MF_CHECKED : MF_UNCHECKED),
+      CMD_VIEW_SNAPWINDOWSIZE, "Snap Window Size");
+    hColorsMenu = CreatePopupMenu();
+    for (unsigned int i = 0; i < ARRAY_COUNT(palettes); i++)
+        AppendMenu(hColorsMenu, MF_STRING, CMD_VIEW_COLORS + i, palettes[i].name);
+    AppendMenu(hViewMenu, MF_POPUP | MF_STRING, (UINT_PTR) hColorsMenu, "Color Theme");
+    AppendMenu(hMenuBar, MF_POPUP | MF_STRING, (UINT_PTR)hViewMenu, "View");
+    AppendMenu(hPopupMenu, MF_POPUP | MF_STRING, (UINT_PTR)hViewMenu, "View");
+    
+    hOptionsMenu = CreateMenu();
+    AppendMenu(hOptionsMenu, MF_STRING, CMD_OPTIONS_CONFIGUREKEYS, "Configure Keys");
+    AppendMenu(hMenuBar, MF_POPUP | MF_STRING, (UINT_PTR)hOptionsMenu, "Options");
+    AppendMenu(hPopupMenu, MF_POPUP | MF_STRING, (UINT_PTR)hOptionsMenu, "Options");
+    
+    hHelpMenu = CreateMenu();
+    AppendMenu(hHelpMenu, MF_STRING, CMD_HELP_ABOUT, "About");
+    AppendMenu(hMenuBar, MF_POPUP | MF_STRING, (UINT_PTR)hHelpMenu, "Help");
+    AppendMenu(hPopupMenu, MF_POPUP | MF_STRING, (UINT_PTR)hHelpMenu, "Help");
+}
+
+LRESULT CALLBACK wnd_proc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    switch (msg)
+    {
+      case WM_WINDOWPOSCHANGING:
+        {
+            WINDOWPOS *wp = (WINDOWPOS *)lParam;
+            
+            if (!(wp->flags & SWP_NOSIZE))  // We're only interested in size changes
+            {
+                // Ensure that the dimensions are not negative.
+                // For some reason, wp->cy can be negative if the user drags the window vertically enough,
+                // but wp->cx doesn't seem to do this.
+                int clientWidth = MAX(wp->cx - clientDiffX, 0);
+                int clientHeight = MAX(wp->cy - clientDiffY, 0);
+                
+                if (gConfig.snapWindowSize)
+                {
+                    int scaleFactor = MAX((clientWidth + GB_DISPLAY_WIDTH / 2) / GB_DISPLAY_WIDTH, (clientHeight + GB_DISPLAY_HEIGHT / 2) / GB_DISPLAY_HEIGHT);
+                    
+                    if (scaleFactor < 1)
+                        scaleFactor = 1;
+                    gConfig.windowWidth = scaleFactor * GB_DISPLAY_WIDTH;
+                    gConfig.windowHeight = scaleFactor * GB_DISPLAY_HEIGHT;
+                    wp->cx = gConfig.windowWidth + clientDiffX;
+                    wp->cy = gConfig.windowHeight + clientDiffY;
+                }
+                else if (gConfig.fixedAspectRatio)
+                {
+                    if (clientWidth * GB_DISPLAY_HEIGHT < clientHeight * GB_DISPLAY_WIDTH)
+                        clientWidth = clientHeight * GB_DISPLAY_WIDTH / GB_DISPLAY_HEIGHT;
+                    else
+                        clientHeight = clientWidth * GB_DISPLAY_HEIGHT / GB_DISPLAY_WIDTH;
+                    gConfig.windowWidth = clientWidth;
+                    gConfig.windowHeight = clientHeight;
+                    wp->cx = gConfig.windowWidth + clientDiffX;
+                    wp->cy = gConfig.windowHeight + clientDiffY;
+                }
+                else
+                {
+                    gConfig.windowWidth = clientWidth;
+                    gConfig.windowHeight = clientHeight;
+                }
+            }
+        }
+        break;
+      case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC hDC;
+            
+            hDC = BeginPaint(hWnd, &ps);
+            if (!isRunning)
+            {
+                StretchDIBits(hDC, 0, 0, gConfig.windowWidth, gConfig.windowHeight, 0, 0, GB_DISPLAY_WIDTH, GB_DISPLAY_HEIGHT,
+                  frameBufferPixels, (BITMAPINFO *)&bmpInfo, DIB_RGB_COLORS, SRCCOPY);
+            }
+            EndPaint(hWnd, &ps);
+        }
+        break;
+      case WM_KEYDOWN:
+        // Ignore automatic key repeats. Bit 30 of lParam must be zero,
+        // meaning that the key was up before this message was sent.
+        if ((lParam & (1 << 30)) == 0)
+        {
+            unsigned int key = (lParam >> 16) & 0x1FF;
+            
+            if      (key == gConfig.keys.a)
+                gameboy_joypad_press(KEY_A_BUTTON);
+            else if (key == gConfig.keys.b)
+                gameboy_joypad_press(KEY_B_BUTTON);
+            else if (key == gConfig.keys.start)
+                gameboy_joypad_press(KEY_START_BUTTON);
+            else if (key == gConfig.keys.select)
+                gameboy_joypad_press(KEY_SELECT_BUTTON);
+            else if (key == gConfig.keys.up)
+                gameboy_joypad_press(KEY_DPAD_UP);
+            else if (key == gConfig.keys.down)
+                gameboy_joypad_press(KEY_DPAD_DOWN);
+            else if (key == gConfig.keys.left)
+                gameboy_joypad_press(KEY_DPAD_LEFT);
+            else if (key == gConfig.keys.right)
+                gameboy_joypad_press(KEY_DPAD_RIGHT);
+            else if (key == gConfig.keys.fastFwd)
+                fastForward = true;
+        }
+        break;
+      case WM_KEYUP:
+        {
+            unsigned int key = (lParam >> 16) & 0x1FF;
+            
+            if      (key == gConfig.keys.a)
+                gameboy_joypad_release(KEY_A_BUTTON);
+            else if (key == gConfig.keys.b)
+                gameboy_joypad_release(KEY_B_BUTTON);
+            else if (key == gConfig.keys.start)
+                gameboy_joypad_release(KEY_START_BUTTON);
+            else if (key == gConfig.keys.select)
+                gameboy_joypad_release(KEY_SELECT_BUTTON);
+            else if (key == gConfig.keys.up)
+                gameboy_joypad_release(KEY_DPAD_UP);
+            else if (key == gConfig.keys.down)
+                gameboy_joypad_release(KEY_DPAD_DOWN);
+            else if (key == gConfig.keys.left)
+                gameboy_joypad_release(KEY_DPAD_LEFT);
+            else if (key == gConfig.keys.right)
+                gameboy_joypad_release(KEY_DPAD_RIGHT);
+            else if (key == gConfig.keys.fastFwd)
+                fastForward = false;
+        }
+        break;
+      case WM_RBUTTONUP:
+        {
+            POINT cursorPos;
+            
+            GetCursorPos(&cursorPos);
+            TrackPopupMenu(hPopupMenu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON, cursorPos.x, cursorPos.y, 0, hWnd, NULL);
+        }
+        break;
+      case WM_COMMAND:
+        switch (LOWORD(wParam))
+        {
+          case CMD_FILE_OPEN:
+            {
+                OPENFILENAME ofn;
+                char filename[MAX_PATH];
+                
+                filename[0] = '\0';
+                memset(&ofn, 0, sizeof(ofn));
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = hWnd;
+                ofn.lpstrFilter = "Game Boy ROM\0*.gb\0";
+                ofn.lpstrFile = filename;
+                ofn.lpstrInitialDir = currentDirectory;
+                ofn.nMaxFile = sizeof(filename);
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+                if (GetOpenFileName(&ofn))
+                    try_load_rom(filename);
+            }
+            break;
+          case CMD_FILE_CLOSE:
+            close_game();
+            break;
+          case CMD_FILE_EXIT:
+            PostQuitMessage(0);
+            break;
+          case CMD_EMULATION_RESET:
+            close_game();
+            try_load_rom(currentRomName);
+            break;
+          case CMD_EMULATION_PAUSE:
+            pause_game();
+            break;
+          case CMD_EMULATION_RESUME:
+            resume_game();
+            break;
+          case CMD_EMULATION_STEPFRAME:
+            gameboy_run_frame();
+            break;
+          case CMD_VIEW_SHOWMENUBAR:
+            gConfig.showMenuBar = !gConfig.showMenuBar;
+            CheckMenuItem(hMenuBar, CMD_VIEW_SHOWMENUBAR, gConfig.showMenuBar ? MF_CHECKED : MF_UNCHECKED);
+            if (gConfig.showMenuBar)
+                SetMenu(hWnd, hMenuBar);
+            else
+                SetMenu(hWnd, NULL);
+            calc_client_diff();
+            update_window_size();
+            break;
+          case CMD_VIEW_FIXEDASPECTRATIO:
+            gConfig.fixedAspectRatio = !gConfig.fixedAspectRatio;
+            CheckMenuItem(hMenuBar, CMD_VIEW_FIXEDASPECTRATIO, gConfig.fixedAspectRatio ? MF_CHECKED : MF_UNCHECKED);
+            break;
+          case CMD_VIEW_SNAPWINDOWSIZE:
+            gConfig.snapWindowSize = !gConfig.snapWindowSize;
+            CheckMenuItem(hMenuBar, CMD_VIEW_SNAPWINDOWSIZE, gConfig.snapWindowSize ? MF_CHECKED : MF_UNCHECKED);
+            break;
+          case CMD_OPTIONS_CONFIGUREKEYS:
+            if (hKeyConfigDialog == NULL)
+            {
+                hKeyConfigDialog = CreateDialog(NULL, MAKEINTRESOURCE(ID_DIALOG_KEYS), hWnd, keys_dlg_proc);
+                ShowWindow(hKeyConfigDialog, SW_SHOW);
+            }
+            else
+                SetActiveWindow(hKeyConfigDialog);
+            break;
+          case CMD_HELP_ABOUT:
+            if (hAboutDialog == NULL)
+            {
+                hAboutDialog = CreateDialog(NULL, MAKEINTRESOURCE(ID_DIALOG_ABOUT), hWnd, about_dlg_proc);
+                ShowWindow(hAboutDialog, SW_SHOW);
+            }
+            else
+                SetActiveWindow(hAboutDialog);
+            break;
+          default:
+            if (LOWORD(wParam) >= CMD_VIEW_COLORS)
+                set_palette(LOWORD(wParam) - CMD_VIEW_COLORS);
+            break;
+        }
+        break;
+      case WM_DROPFILES:
+        {
+            HDROP hDrop = (HDROP)wParam;
+            char filename[MAX_PATH];
+            
+            if (DragQueryFile(hDrop, 0, filename, sizeof(filename)))
+                try_load_rom(filename);
+            DragFinish(hDrop);
+        }
+        break;
+      case WM_CREATE:
+        create_main_menu();
+        if (gConfig.showMenuBar)
+            SetMenu(hWnd, hMenuBar);
+        break;
+      case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+      case WM_THEMECHANGED:
+        calc_client_diff();
+        break;
+      default:
+        return DefWindowProc(hWnd, msg, wParam, lParam);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    HINSTANCE hInstance;
+    char *lastSlash;
+    HACCEL hAccelTable;
+    WNDCLASS wc;
+    RECT winRect;
+    //WAVEFORMATEX wfex;
+    //WAVEHDR wavehdr;
+    MSG msg;
+    unsigned long ticks;
+    unsigned long newTicks;
+    
+    config_load("gbemu_cfg.txt");
+    InitCommonControls();
+    hInstance = GetModuleHandle(NULL);
+    GetModuleFileName(hInstance, currentDirectory, sizeof(currentDirectory));
+    lastSlash = strrchr(currentDirectory, '\\');
+    if (lastSlash != NULL)
+        *lastSlash = '\0';
+    SetCurrentDirectory(currentDirectory);
+    hAccelTable = CreateAcceleratorTable(kbAccelTable, ARRAY_COUNT(kbAccelTable));
+    if (hAccelTable == NULL)
+        platform_error("Could not create accelerator table");
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc = wnd_proc;
+    wc.hInstance = hInstance;
+    wc.hIcon = LoadIcon(hInstance, MAKEINTRESOURCE(ID_APPICON));
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.lpszClassName = wndClassName;
+    if (RegisterClass(&wc) == 0)
+        platform_fatal_error("Failed to register window class.");
+    winRect.left = 0;
+    winRect.top = 0;
+    winRect.right = gConfig.windowWidth;
+    winRect.bottom = gConfig.windowHeight;
+    AdjustWindowRect(&winRect, WS_OVERLAPPEDWINDOW, gConfig.showMenuBar);
+    hWnd = CreateWindow(wndClassName, APPNAME, WS_OVERLAPPEDWINDOW,
+      CW_USEDEFAULT, CW_USEDEFAULT, winRect.right - winRect.left, winRect.bottom - winRect.top,
+      NULL, NULL, hInstance, NULL);
+    if (hWnd == NULL)
+        platform_fatal_error("Failed to create window.");
+    DragAcceptFiles(hWnd, TRUE);
+    calc_client_diff();
+    update_window_size();
+    set_palette(gConfig.colorPalette);
+    
+    /*
+    wfex.wFormatTag = WAVE_FORMAT_PCM;
+    wfex.nChannels = 2;
+    wfex.nSamplesPerSec = SAMPLE_RATE;
+    wfex.wBitsPerSample = 8;
+    wfex.nBlockAlign = wfex.nChannels * wfex.wBitsPerSample / 8;
+    wfex.nAvgBytesPerSec = wfex.nSamplesPerSec * wfex.nBlockAlign;
+    wfex.cbSize = 0;
+    if (waveOutOpen(&hAudioDevice, WAVE_MAPPER, &wfex, 0, 0, 0) != MMSYSERR_NOERROR)
+        platform_error("Failed to open audio device. %s", get_error_text(GetLastError()));
+    unsigned int seconds = 5;
+    unsigned int bufSize = wfex.nBlockAlign * SAMPLE_RATE * seconds;
+    uint8_t buffer[bufSize];
+    uint8_t *p = buffer;
+    unsigned int nSamples = bufSize / (wfex.nBlockAlign);
+    for (unsigned int sampleNum = 0; sampleNum < nSamples; sampleNum++)
+    {
+        assert(p < buffer + bufSize);
+        if (sampleNum & 0x10)
+        {
+            *(p++) = 128 + 64;
+            *(p++) = 128;
+        }
+        else
+        {
+            *(p++) = 128 - 64;
+            *(p++) = 128;
+        }
+    }
+    wavehdr.lpData = buffer;
+    wavehdr.dwBufferLength = bufSize;
+    wavehdr.dwLoops = 1;
+    wavehdr.dwFlags = 0;
+    if (waveOutPrepareHeader(hAudioDevice, &wavehdr, sizeof(wavehdr)) != MMSYSERR_NOERROR)
+        platform_error("Failed to prepare header. %s", get_error_text(GetLastError()));
+    waveOutWrite(hAudioDevice, &wavehdr, sizeof(wavehdr));
+    while (!(wavehdr.dwFlags & WHDR_DONE))
+        Sleep(6);
+    */
+    if (argc >= 2)
+        try_load_rom(argv[1]);
+    
+    ShowWindow(hWnd, SW_SHOW);
+    
+    ticks = timeGetTime();
+    while (1)
+    {
+        if (isRunning)
+        {
+            if (PeekMessage(&msg, NULL, 0, 0, TRUE))
+            {
+                if (msg.message == WM_QUIT)
+                    break;
+                if (!TranslateAccelerator(hWnd, hAccelTable, &msg))
+                {
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+                if (!isRunning)
+                    goto skip_frame;  // Hack: We don't want to run another frame after closing the ROM.
+            }
+            gameboy_run_frame();
+            if (!fastForward)
+            {
+                newTicks = timeGetTime();
+                //printf("newTicks = %u\n", newTicks);
+                if (newTicks - ticks < (1000 / 60))
+                {
+                    Sleep((1000 / 60) - (newTicks - ticks));
+                }
+                ticks = newTicks;
+            }
+        }
+        else
+        {
+            if (GetMessage(&msg, NULL, 0, 0) <= 0)
+                break;
+            if (!TranslateAccelerator(hWnd, hAccelTable, &msg))
+            {
+                TranslateMessage(&msg);
+                DispatchMessage(&msg);
+            }
+        }
+      skip_frame:
+        ;
+    }
+    gameboy_close_rom();
+    config_save(CONFIG_FILE_NAME);
+    return 0;
+}
